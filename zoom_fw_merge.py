@@ -52,6 +52,7 @@ class ZoomFirmware:
         self.blocks_count = struct.unpack_from('<H', self.raw, 8)[0]
         self.total_data_blocks = self.blocks_count - 10
 
+        self.reserved_table_end = 0
         self._find_active_table()
         self._parse_entries()
         self._build_block_map()
@@ -101,12 +102,8 @@ class ZoomFirmware:
 
     def _build_block_map(self):
         self.block_owner = [None] * self.total_data_blocks
-
-        table_end = self.table_entries_end
-        if table_end > DATA_OFFSET:
-            table_blocks_in_data = (table_end - DATA_OFFSET + BLOCK_SIZE - 1) // BLOCK_SIZE
-            for i in range(table_blocks_in_data):
-                self.block_owner[i] = '__FILE_TABLE__'
+        for i in self._table_blocks():
+            self.block_owner[i] = '__FILE_TABLE__'
 
         for p in self.patches:
             current = p['start_block']
@@ -161,19 +158,33 @@ class ZoomFirmware:
         return chain
 
     def reserve_table_blocks(self, extra_entries=0):
-        """Reserve data blocks the file table will need after adding entries.
+        """Reserve data blocks the file table will grow into.
 
         Must be called BEFORE injecting patches, with the total number of
-        patches to add, so blocks are protected before any data lands on them.
+        patches to add. Files already sitting in those blocks are relocated.
         """
         future_end = self.table_entries_end + max(1, extra_entries) * ENTRY_SIZE
-        if future_end > DATA_OFFSET:
-            needed_blocks = (future_end - DATA_OFFSET + BLOCK_SIZE - 1) // BLOCK_SIZE
-            for i in range(needed_blocks):
-                if self.block_owner[i] is None:
-                    self.block_owner[i] = '__FILE_TABLE__'
-                    blk_off = DATA_OFFSET + i * BLOCK_SIZE
-                    self.raw[blk_off:blk_off + 6] = b'\xFF' * 6
+        self.reserved_table_end = max(self.reserved_table_end, future_end)
+        self._build_block_map()
+        blockers = {self.block_owner[i] for i in self._table_blocks()
+                    if self.block_owner[i] not in (None, '__FILE_TABLE__')}
+        for name in blockers:
+            p = self.get_patch(name)
+            content, entry = self.read_file_content(p), p['entry_bytes']
+            self.remove_patch(name)
+            self.inject_patch(name, content, entry)
+        blocks = self._table_blocks()
+        for i in blocks:
+            assert self.block_owner[i] == '__FILE_TABLE__'
+        if len(blocks):
+            region_end = DATA_OFFSET + len(blocks) * BLOCK_SIZE
+            self.raw[self.table_entries_end:region_end] = b'\xFF' * (region_end - self.table_entries_end)
+
+    def _table_blocks(self):
+        end = max(self.table_entries_end, self.reserved_table_end)
+        if end <= DATA_OFFSET:
+            return range(0)
+        return range((end - DATA_OFFSET + BLOCK_SIZE - 1) // BLOCK_SIZE)
 
     def remove_patch(self, filename):
         idx = None
@@ -223,6 +234,7 @@ class ZoomFirmware:
 
         entry = bytearray(src_entry_bytes)
         struct.pack_into('<H', entry, 0, allocated[0])
+        struct.pack_into('<I', entry, 4, len(content))
 
         for i, block_num in enumerate(allocated):
             blk = bytearray(b'\xFF' * BLOCK_SIZE)
@@ -253,6 +265,24 @@ class ZoomFirmware:
 
         return blocks_needed
 
+    def get_patch(self, filename):
+        return next((p for p in self.patches if p['filename'] == filename), None)
+
+    def replace_file(self, filename, content):
+        old = self.get_patch(filename)
+        entry_bytes = old['entry_bytes']
+        self.remove_patch(filename)
+        self.reserve_table_blocks(1)
+        self.inject_patch(filename, content, entry_bytes)
+
+    def read_effect_list(self):
+        p = self.get_patch(FLST_NAME)
+        return parse_flst(self.read_file_content(p)) if p else None
+
+    def write_effect_list(self, sections):
+        p = self.get_patch(FLST_NAME)
+        self.replace_file(FLST_NAME, build_flst(sections, p['size']))
+
     def save(self, filepath):
         with open(filepath, 'wb') as f:
             f.write(self.raw)
@@ -272,6 +302,71 @@ class ZoomFirmware:
             return None
         name_bytes = content[ff4 - 12:ff4]
         return name_bytes.decode('ascii', errors='replace').strip().rstrip('\x00')
+
+
+FLST_NAME = 'FLST_SEQ.ZDT'
+FLST_REC = 13
+CATEGORY_NAMES = {0: 'THRU', 1: 'DYNAMICS', 2: 'FILTER', 3: 'DRIVE', 4: 'AMP',
+                  6: 'MODULATION', 7: 'SFX', 8: 'DELAY', 9: 'REVERB'}
+
+
+def parse_flst(data):
+    """Parse FLST_SEQ.ZDT — the effect menu order, grouped by category.
+
+    13-byte records: '>>>\\0<cat>' opens a category, '<<<\\0<cat>' closes it,
+    records in between are null-padded ZDL filenames ('' = empty slot).
+    Returns [[cat_id, [names...]], ...]. Effects missing here never show up
+    in the pedal's menu even if their ZDL is present.
+    """
+    sections, cur = [], None
+    for i in range(0, len(data) - FLST_REC + 1, FLST_REC):
+        rec = data[i:i + FLST_REC]
+        if rec[:3] == b'>>>':
+            cur = [rec[4], []]
+        elif rec[:3] == b'<<<':
+            sections.append(cur)
+            cur = None
+        elif cur is not None:
+            cur[1].append(rec.rstrip(b'\0').decode('ascii'))
+    return sections
+
+
+def build_flst(sections, size):
+    out = bytearray()
+    for cat, names in sections:
+        out += (b'>>>\0' + bytes([cat])).ljust(FLST_REC, b'\0')
+        for n in names:
+            out += n.encode('ascii').ljust(FLST_REC, b'\0')
+        out += (b'<<<\0' + bytes([cat])).ljust(FLST_REC, b'\0')
+    if len(out) > size:
+        raise ValueError(f"effect list needs {len(out)} bytes, file holds {size}")
+    return bytes(out.ljust(size, b'\0'))
+
+
+def flst_add(target, source, names):
+    """Add names to target sections using their category/order from source."""
+    src_cat = {n: cat for cat, ns in source for n in ns}
+    src_pos = {n: i for i, n in enumerate(n for _, ns in source for n in ns)}
+    by_cat = {cat: ns for cat, ns in target}
+    missing = []
+    for n in sorted(names, key=lambda n: src_pos.get(n, len(src_pos))):
+        cat = src_cat.get(n)
+        if cat is None:
+            missing.append(n)
+            continue
+        if cat not in by_cat:
+            by_cat[cat] = []
+            target.append([cat, by_cat[cat]])
+        if n not in by_cat[cat]:
+            by_cat[cat].append(n)
+    target.sort(key=lambda s: s[0])
+    return missing
+
+
+def flst_remove(sections, names):
+    drop = set(names)
+    for s in sections:
+        s[1] = [n for n in s[1] if n not in drop]
 
 
 def blocks_for(size):
@@ -363,6 +458,11 @@ def cmd_remove(args):
         except ValueError as e:
             print(f"  SKIP {name}: {e}")
 
+    effect_list = fw.read_effect_list()
+    if effect_list is not None:
+        flst_remove(effect_list, to_remove)
+        fw.write_effect_list(effect_list)
+
     fw.save(args.output)
 
     verify = ZoomFirmware(args.output)
@@ -417,6 +517,18 @@ def cmd_merge(args):
         except ValueError as e:
             print(f"  FAIL {name}: {e}")
             break
+
+    added_names = [p['filename'] for p in fw_target.patches if p['filename'] in set(to_add)]
+    target_list = fw_target.read_effect_list()
+    source_list = fw_source.read_effect_list()
+    if target_list is not None and source_list is not None:
+        missing = flst_add(target_list, source_list, added_names)
+        fw_target.write_effect_list(target_list)
+        print(f"\nEffect menu ({FLST_NAME}) updated:")
+        for cat, names in target_list:
+            print(f"  {CATEGORY_NAMES.get(cat, cat)}: {len([n for n in names if n])}")
+        if missing:
+            print(f"  not in source menu (support files, hidden): {', '.join(missing)}")
 
     fw_target.save(args.output)
 

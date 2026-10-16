@@ -7,7 +7,8 @@ Merge ZDL effects between Zoom MultiStomp pedal firmwares. All models (MS-50G, M
 ## Requirements
 
 - Python 3.6+
-- No external dependencies
+- `zoom_fw_merge.py`: no external dependencies
+- `zoom_flash.py`: `pip install mido python-rtmidi`
 
 ## Getting the firmware files
 
@@ -55,7 +56,8 @@ The MS-70CDR firmware only has ~17 free blocks. To fit all 30 MS-50G effects (~1
 # Remove bass-specific effects (useless on guitar)
 python3 zoom_fw_merge.py remove ms70cdr/FS.bin -o trimmed_FS.bin \
   --effects B_CHORUS.ZDL B_FLNGR.ZDL B_GEQ.ZDL B_DETUNE.ZDL B_ENSMBL.ZDL \
-  B_OCTAVE.ZDL B_PEQ.ZDL B_PITCH.ZDL B_CRY.ZDL B_ATWAH.ZDL BOTTOM_B.ZDL ST_B_GEQ.ZDL
+  B_OCTAVE.ZDL B_PEQ.ZDL B_PITCH.ZDL B_CRY.ZDL B_ATWAH.ZDL BOTTOM_B.ZDL ST_B_GEQ.ZDL \
+  MNGLD_SP.ZDL SPC_HOLE.ZDL LOFIDLY.ZDL DUAL_CMP.ZDL
 
 # Then merge
 python3 zoom_fw_merge.py merge --target trimmed_FS.bin --source ms50g/FS.bin -o final_FS.bin
@@ -63,13 +65,62 @@ python3 zoom_fw_merge.py merge --target trimmed_FS.bin --source ms50g/FS.bin -o 
 
 ## Flashing the modified firmware
 
-### Windows
+### Python flasher (macOS / Linux / Windows)
+
+`zoom_flash.py` talks to the pedal's bootloader directly — no official updater needed.
+
+```bash
+pip install mido python-rtmidi
+
+# Hold both arrow buttons on the pedal while connecting USB (update mode), then:
+python3 zoom_flash.py final_FS.bin --log flash.log
+
+# Check what would be sent without touching the pedal:
+python3 zoom_flash.py final_FS.bin --dry-run
+```
+
+By default only `FS.bin` (the effects filesystem) is written; the bootloader and main
+firmware stay untouched. `--full DIR` reproduces the official updater exactly
+(boot.bin, Preset.bin, FS.bin, Main.bin from an extracted updater's `Resources` folder).
+
+Tested on MS-70CDR (boot 1.10): FS.bin flashed in ~40 s, all 1426 packets acknowledged.
+If anything fails mid-way the pedal stays in update mode — just re-run the script
+(or the official updater with the stock firmware).
+
+#### Update-mode protocol
+
+Reverse-engineered from the official macOS updater (`_allocateFlashErase`, `_allocateFlashWrite`, `-[MainWindow DoUpdate]`, `_RomProcedure`):
+
+| Message | Bytes |
+|---|---|
+| Identity request | `F0 7E 00 06 01 F7` → `F0 7E 00 06 02 52 <dev> 00 00 00 <boot ver> F7` |
+| CanUpdate | `F0 52 00 <dev> 01 F7` |
+| FlashErase | `F0 52 00 <dev> 0A <addr:5×7bit LE> <size:5×7bit LE> F7` |
+| FlashWrite | `F0 52 00 <dev> 02 <addr:5×7bit LE> <len:2×7bit LE> <data, 8→7 encoded> <crc32:5×7bit LE> F7` |
+| PacketProcessed (finish) | `F0 52 00 <dev> 04 F7` |
+| Pedal reply | `F0 52 00 <dev> 00 <status> F7`, status `00` = OK |
+
+- Writes are 2048-byte chunks; each waits for a reply.
+- 8→7 encoding: per 7 data bytes, one header byte whose bit `0x40 >> j` holds the MSB of byte `j`, then the 7 bytes with MSB cleared.
+- CRC32: standard table, init `0xFFFFFFFF`, **no** final XOR, over the raw 8-bit chunk.
+
+Flash layout (official procedure, in order):
+
+| Step | Address | Size | Content |
+|---|---|---|---|
+| erase | `0x0EF000` | `0x1000` | — |
+| erase + write | `0x000000` | `0x40000` | boot.bin (bootloader) |
+| erase + write | `0x3FD000` | `0x3000` | Preset.bin |
+| erase + write | `0x0F0000` | `0x2C7000` | FS.bin |
+| erase + write | `0x040000` | `0xB0000` | Main.bin |
+
+### Windows (official updater)
 
 1. Replace `FS.bin` in the updater folder with your modified version
 2. Hold **both arrow buttons** on the pedal, then connect USB
 3. Run the updater, select `ZOOM MS Series` for MIDI IN/OUT, click "Execute"
 
-### macOS (modern versions — Sequoia, Sonoma, etc.)
+### macOS (official updater on modern versions — Sequoia, Sonoma, etc.)
 
 The official Mac updater (built for macOS 10.14) crashes on modern macOS due to a removed `setTextColor:` API on `_NSAlertButton`. It also validates `FS.bin` via MD5 hash embedded in the binary. Two patches are needed:
 
@@ -262,6 +313,14 @@ The tool parses the FS.bin filesystem used by Zoom MultiStomp pedals:
 - Each table entry (32 bytes) points to a chain of 4096-byte data blocks
 - Data blocks are doubly-linked (prev/next pointers) with up to 4090 bytes of payload
 - Effects are stored as `.ZDL` files containing DSP code and metadata
+- `FLST_SEQ.ZDT` is the effect menu: 13-byte records, `>>>\0<cat>` opens a category,
+  `<<<\0<cat>` closes it, null-padded ZDL names in between. **An effect not listed here
+  never shows up on the pedal**, even if its ZDL is present. `merge` adds new effects to
+  their source category (creating DRIVE=3 / AMP=4 on MS-70CDR, which has none), `remove`
+  drops them from the list. Categories: 1 DYN, 2 FILTER, 3 DRIVE, 4 AMP, 6 MOD, 7 SFX, 8 DELAY, 9 REVERB.
+- The file table can grow past `0xA000` into the first data blocks. Before injecting,
+  the tool reserves every block the table will need and relocates any file sitting there
+  (otherwise the pedal fails to boot with `Init Err: -10205`).
 
 The filesystem format was reverse-engineered from the [ZoomFirmwareEditor](https://github.com/Barsik-Barbosik/Zoom-Firmware-Editor) Java application (v0.98).
 

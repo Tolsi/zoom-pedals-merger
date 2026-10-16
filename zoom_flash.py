@@ -1,464 +1,246 @@
 #!/usr/bin/env python3
 """
-Zoom MultiStomp firmware flasher — writes FS.bin to pedal via MIDI SysEx.
+Zoom MultiStomp firmware flasher (MS-50G / MS-60B / MS-70CDR) over MIDI SysEx.
 
-Uses macOS CoreMIDI directly via ctypes (no compiled dependencies).
+Protocol reverse-engineered from the official "EFX Updater" (MS-70CDR v2.10, macOS):
 
+  CanUpdate       F0 52 00 <dev> 01 F7
+  FlashErase      F0 52 00 <dev> 0A <addr:5x7bit LE> <size:5x7bit LE> F7
+  FlashWrite      F0 52 00 <dev> 02 <addr:5x7bit LE> <len:2x7bit LE> <data 8->7 encoded> <crc32:5x7bit LE> F7
+  PacketProcessed F0 52 00 <dev> 04 F7
+  Pedal reply     F0 52 00 <dev> 00 <status> F7   (status 00 = OK)
+
+The updater runs this ROM procedure (addr, size, file):
+  erase 0x0EF000 0x001000
+  erase/write 0x000000 0x040000 boot.bin    (bootloader!)
+  erase/write 0x3FD000 0x003000 Preset.bin
+  erase/write 0x0F0000 0x2C7000 FS.bin      (effects filesystem)
+  erase/write 0x040000 0x0B0000 Main.bin
+then sends PacketProcessed. Writes go in 2048-byte chunks, each acknowledged.
+
+By default only FS.bin is flashed (bootloader and main firmware untouched).
 The pedal must be in update mode: hold both arrow buttons while connecting USB.
-It will show up as "ZOOM MS Series" MIDI device.
 
-Protocol reverse-engineered from the official EFX Updater binary.
-
-Usage:
-    python3 zoom_flash.py /path/to/FS.bin
-
-WARNING: This can brick your pedal. Use at your own risk.
-Keep the original updater app and stock FS.bin as backup.
+Requires: pip install mido python-rtmidi
 """
 
-import ctypes
-import ctypes.util
-import struct
-import time
-import sys
+import argparse
 import os
-import threading
+import sys
+import time
+import zlib
 
-# CoreMIDI constants
-kCFStringEncodingUTF8 = 0x08000100
+import mido
 
-# Zoom SysEx protocol
-ZOOM_MANUFACTURER_ID = 0x52
-MS70CDR_DEVICE_ID = 0x61
-MS50G_DEVICE_ID = 0x58
-MS60B_DEVICE_ID = 0x5F
-
-# Flash addresses from ROM procedure in EFX Updater binary
-FLASH_MAP = {
-    'FS.bin': {'address': 0x040000, 'erase_size': 0x0B0000},
-    'Preset.bin': {'address': 0x000000, 'erase_size': 0x040000},
-    'boot.bin': {'address': 0x3FD000, 'erase_size': 0x003000},
-    'Main.bin': {'address': 0x0F0000, 'erase_size': 0x2C7000},
+CHUNK = 0x800
+MARKER_ERASE = (0x0EF000, 0x001000)
+LAYOUT = {
+    'boot.bin': (0x000000, 0x040000),
+    'Preset.bin': (0x3FD000, 0x003000),
+    'FS.bin': (0x0F0000, 0x2C7000),
+    'Main.bin': (0x040000, 0x0B0000),
 }
+FULL_ORDER = ['boot.bin', 'Preset.bin', 'FS.bin', 'Main.bin']
+DEVICES = {0x58: 'MS-50G', 0x5F: 'MS-60B', 0x61: 'MS-70CDR'}
 
-FLASH_WRITE_CHUNK = 64
+
+def septets(value, n):
+    return [(value >> (7 * i)) & 0x7F for i in range(n)]
 
 
-class CoreMIDI:
-    """Minimal CoreMIDI wrapper via ctypes for macOS."""
+def convert8to7(data):
+    out = []
+    for i in range(0, len(data), 7):
+        group = data[i:i + 7]
+        head = 0
+        for j, b in enumerate(group):
+            if b & 0x80:
+                head |= 0x40 >> j
+        out.append(head)
+        out.extend(b & 0x7F for b in group)
+    return out
 
-    def __init__(self):
-        self.cm = ctypes.cdll.LoadLibrary(
-            '/System/Library/Frameworks/CoreMIDI.framework/CoreMIDI')
-        self.cf = ctypes.cdll.LoadLibrary(
-            '/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
 
-        self._setup_types()
+def crc32(data):
+    # Updater uses the standard table with init 0xFFFFFFFF but no final XOR.
+    return zlib.crc32(data) ^ 0xFFFFFFFF
 
-        self.client = ctypes.c_uint32()
-        name = self._cfstr("ZoomFlasher")
-        err = self.cm.MIDIClientCreate(name, None, None, ctypes.byref(self.client))
-        if err != 0:
-            raise RuntimeError(f"MIDIClientCreate failed: {err}")
 
-        self.out_port = ctypes.c_uint32()
-        err = self.cm.MIDIOutputPortCreate(
-            self.client, self._cfstr("Out"), ctypes.byref(self.out_port))
-        if err != 0:
-            raise RuntimeError(f"MIDIOutputPortCreate failed: {err}")
+def msg_can_update(dev):
+    return [0x52, 0x00, dev, 0x01]
 
-        self.in_port = ctypes.c_uint32()
-        self._received = []
-        self._lock = threading.Lock()
 
-        self._READPROC = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p)
-        self._read_callback = self._READPROC(self._midi_read)
+def msg_packet_processed(dev):
+    return [0x52, 0x00, dev, 0x04]
 
-        err = self.cm.MIDIInputPortCreate(
-            self.client, self._cfstr("In"),
-            self._read_callback, None,
-            ctypes.byref(self.in_port))
-        if err != 0:
-            raise RuntimeError(f"MIDIInputPortCreate failed: {err}")
 
-    def _setup_types(self):
-        self.cf.CFStringCreateWithCString.restype = ctypes.c_void_p
-        self.cf.CFStringCreateWithCString.argtypes = [
-            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
-        self.cf.CFStringGetCString.restype = ctypes.c_bool
-        self.cf.CFStringGetCString.argtypes = [
-            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
-        self.cf.CFStringGetLength.restype = ctypes.c_long
-        self.cf.CFStringGetLength.argtypes = [ctypes.c_void_p]
+def msg_erase(dev, addr, size):
+    return [0x52, 0x00, dev, 0x0A] + septets(addr, 5) + septets(size, 5)
 
-        self.cm.MIDIObjectGetStringProperty.restype = ctypes.c_int32
-        self.cm.MIDIObjectGetStringProperty.argtypes = [
-            ctypes.c_uint32, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
-        self.cm.MIDISendSysex.restype = ctypes.c_int32
 
-    def _cfstr(self, s):
-        return self.cf.CFStringCreateWithCString(None, s.encode(), kCFStringEncodingUTF8)
+def msg_write(dev, addr, chunk):
+    return ([0x52, 0x00, dev, 0x02] + septets(addr, 5) + septets(len(chunk), 2)
+            + convert8to7(chunk) + septets(crc32(chunk), 5))
 
-    def _get_name(self, endpoint):
-        prop = self._cfstr("name")
-        result = ctypes.c_void_p()
-        err = self.cm.MIDIObjectGetStringProperty(endpoint, prop, ctypes.byref(result))
-        if err == 0 and result.value:
-            buf = ctypes.create_string_buffer(256)
-            self.cf.CFStringGetCString(result.value, buf, 256, kCFStringEncodingUTF8)
-            return buf.value.decode('utf-8')
-        return ""
 
-    def _midi_read(self, pkt_list_ptr, read_proc_ref_con):
-        # MIDIPacketList: numPackets (UInt32), then packets
-        # MIDIPacket: timeStamp (UInt64), length (UInt16), data[length]
-        if not pkt_list_ptr:
-            return
-        num_packets = ctypes.cast(pkt_list_ptr, ctypes.POINTER(ctypes.c_uint32))[0]
-        offset = 4  # skip numPackets
-        base = ctypes.cast(pkt_list_ptr, ctypes.POINTER(ctypes.c_uint8))
-        for _ in range(num_packets):
-            # timestamp: 8 bytes, length: 2 bytes
-            length = (base[offset + 8] | (base[offset + 9] << 8))
-            data = bytes(base[offset + 10 + j] for j in range(length))
-            with self._lock:
-                self._received.append(data)
-            offset += 10 + length
-            # Align to 4 bytes (MIDIPacket alignment)
-            # Actually MIDIPacket uses MIDIPacketNext which handles alignment
-            # For simplicity, break after first packet in most cases
-            break
+class Pedal:
+    def __init__(self, port_name, log=None):
+        self.out = mido.open_output(port_name)
+        self.inp = mido.open_input(port_name)
+        self.log = log
+        self.dev = None
 
-    def find_zoom(self):
-        n_dest = self.cm.MIDIGetNumberOfDestinations()
-        n_src = self.cm.MIDIGetNumberOfSources()
+    def _log(self, direction, data):
+        if self.log:
+            self.log.write(f"{time.time():.3f} {direction} {' '.join(f'{b:02x}' for b in data)}\n")
 
-        dest_ep = None
-        src_ep = None
+    def drain(self):
+        for _ in self.inp.iter_pending():
+            pass
 
-        for i in range(n_dest):
-            ep = self.cm.MIDIGetDestination(i)
-            name = self._get_name(ep)
-            if 'zoom' in name.lower() or 'ms' in name.lower():
-                dest_ep = ep
-                break
+    def send(self, data):
+        self._log('>>', data)
+        self.out.send(mido.Message('sysex', data=data))
 
-        for i in range(n_src):
-            ep = self.cm.MIDIGetSource(i)
-            name = self._get_name(ep)
-            if 'zoom' in name.lower() or 'ms' in name.lower():
-                src_ep = ep
-                break
-
-        return dest_ep, src_ep
-
-    def connect_source(self, src_ep):
-        err = self.cm.MIDIPortConnectSource(self.in_port, src_ep, None)
-        if err != 0:
-            raise RuntimeError(f"MIDIPortConnectSource failed: {err}")
-
-    def send_sysex(self, data):
-        """Send a SysEx message (must include F0 and F7)."""
-        # MIDISysexSendRequest struct:
-        # MIDIEndpointRef destination (4 bytes on 32-bit, but we use 64-bit layout)
-        # Actually on macOS 64-bit, MIDISysexSendRequest is:
-        #   destination: MIDIEndpointRef (UInt32)
-        #   data: const Byte * (8 bytes pointer)
-        #   bytesToSend: UInt32
-        #   complete: Boolean (1 byte)
-        #   3 bytes padding
-        #   completionProc: pointer (8)
-        #   completionRefCon: pointer (8)
-        # Total: 4 + 4pad + 8 + 4 + 4 + 8 + 8 = 40 bytes
-        #
-        # Use a simpler approach: MIDISend with a packet list
-        pass
-
-    def send_raw(self, dest_ep, data):
-        """Send raw MIDI bytes via MIDISend."""
-        # Build a MIDIPacketList
-        # numPackets: UInt32 = 1
-        # MIDIPacket: timeStamp(UInt64=0) + length(UInt16) + data
-        pkt_size = 4 + 8 + 2 + len(data)
-        buf = ctypes.create_string_buffer(pkt_size)
-        struct.pack_into('<I', buf, 0, 1)  # numPackets = 1
-        struct.pack_into('<Q', buf, 4, 0)  # timeStamp = 0 (now)
-        struct.pack_into('<H', buf, 12, len(data))  # length
-        for i, b in enumerate(data):
-            buf[14 + i] = b
-
-        err = self.cm.MIDISend(self.out_port, dest_ep, buf)
-        if err != 0:
-            raise RuntimeError(f"MIDISend failed: {err}")
-
-    def send_sysex_async(self, dest_ep, data):
-        """Send SysEx via MIDISendSysex (handles large messages)."""
-        data_buf = (ctypes.c_uint8 * len(data))(*data)
-
-        class MIDISysexSendRequest(ctypes.Structure):
-            _fields_ = [
-                ("destination", ctypes.c_uint32),
-                ("_pad0", ctypes.c_uint32),
-                ("data", ctypes.POINTER(ctypes.c_uint8)),
-                ("bytesToSend", ctypes.c_uint32),
-                ("complete", ctypes.c_uint8),
-                ("_pad1", ctypes.c_uint8 * 3),
-                ("completionProc", ctypes.c_void_p),
-                ("completionRefCon", ctypes.c_void_p),
-            ]
-
-        req = MIDISysexSendRequest()
-        req.destination = dest_ep
-        req.data = data_buf
-        req.bytesToSend = len(data)
-        req.complete = 0
-        req.completionProc = None
-        req.completionRefCon = None
-
-        err = self.cm.MIDISendSysex(ctypes.byref(req))
-        if err != 0:
-            raise RuntimeError(f"MIDISendSysex failed: {err}")
-
-        # Wait for completion
-        for _ in range(200):
-            if req.complete:
-                break
-            time.sleep(0.01)
-
-    def receive(self, timeout=2.0):
-        """Wait for a MIDI message."""
+    def recv(self, timeout):
         deadline = time.time() + timeout
         while time.time() < deadline:
-            with self._lock:
-                if self._received:
-                    return self._received.pop(0)
-            time.sleep(0.01)
+            for m in self.inp.iter_pending():
+                if m.type == 'sysex':
+                    self._log('<<', m.data)
+                    return list(m.data)
+            time.sleep(0.001)
         return None
 
-    def clear_received(self):
-        with self._lock:
-            self._received.clear()
+    def identify(self):
+        self.drain()
+        self.send([0x7E, 0x00, 0x06, 0x01])
+        r = self.recv(3)
+        if not r or r[:4] != [0x7E, 0x00, 0x06, 0x02] or r[4] != 0x52:
+            raise RuntimeError(f"bad identity reply: {r}")
+        self.dev = r[5]
+        version = bytes(r[9:13]).decode('ascii', 'replace')
+        return self.dev, version
+
+    def command(self, data, timeout, what):
+        self.send(data)
+        r = self.recv(timeout)
+        if r is None:
+            raise RuntimeError(f"{what}: no reply in {timeout}s")
+        if r[:4] != [0x52, 0x00, self.dev, 0x00] or len(r) < 5 or r[4] != 0x00:
+            raise RuntimeError(f"{what}: error reply {' '.join(f'{b:02x}' for b in r)}")
+
+    def erase(self, addr, size):
+        self.command(msg_erase(self.dev, addr, size), 120, f"erase 0x{addr:06X}+0x{size:X}")
+
+    def write(self, addr, data, label):
+        total = len(data)
+        for off in range(0, total, CHUNK):
+            chunk = data[off:off + CHUNK]
+            for attempt in range(3):
+                try:
+                    self.command(msg_write(self.dev, addr + off, chunk), 15,
+                                 f"write 0x{addr + off:06X}")
+                    break
+                except RuntimeError as e:
+                    if attempt == 2:
+                        raise
+                    print(f"\n  retry ({e})")
+            done = off + len(chunk)
+            print(f"\r  {label}: {done * 100 // total:3d}%  {done}/{total}", end='', flush=True)
+        print()
 
 
-def encode_7bit(data):
-    """Encode 8-bit data to 7-bit MIDI format.
-
-    For every 7 bytes of input, output 8 bytes:
-    first byte = MSBs of next 7 bytes, then 7 bytes with MSB cleared.
-    """
-    result = bytearray()
-    for i in range(0, len(data), 7):
-        chunk = data[i:i+7]
-        msb_byte = 0
-        for j, b in enumerate(chunk):
-            if b & 0x80:
-                msb_byte |= (1 << j)
-        result.append(msb_byte)
-        for b in chunk:
-            result.append(b & 0x7F)
-    return bytes(result)
+def find_port(hint):
+    names = mido.get_output_names()
+    for n in names:
+        if hint.lower() in n.lower():
+            return n
+    raise SystemExit(f"MIDI port matching '{hint}' not found. Available: {names}")
 
 
-def make_sysex(device_id, *payload):
-    """Build a Zoom SysEx message: F0 52 00 <dev_id> <payload> F7."""
-    msg = bytearray([0xF0, ZOOM_MANUFACTURER_ID, 0x00, device_id])
-    for b in payload:
-        if isinstance(b, (bytes, bytearray)):
-            msg.extend(b)
-        else:
-            msg.append(b)
-    msg.append(0xF7)
-    return bytes(msg)
-
-
-def encode_address(addr):
-    """Encode a 32-bit address as 4 x 7-bit bytes (LSB first)."""
-    return bytes([
-        addr & 0x7F,
-        (addr >> 7) & 0x7F,
-        (addr >> 14) & 0x7F,
-        (addr >> 21) & 0x7F,
-    ])
-
-
-def encode_size(size):
-    """Encode a 32-bit size as 4 x 7-bit bytes (LSB first)."""
-    return encode_address(size)
-
-
-def identity_request():
-    """Universal SysEx Identity Request."""
-    return bytes([0xF0, 0x7E, 0x00, 0x06, 0x01, 0xF7])
-
-
-def parse_identity(data):
-    """Parse Identity Reply. Returns (manufacturer, family, model, version) or None."""
-    if len(data) < 15 or data[0] != 0xF0 or data[1] != 0x7E:
-        return None
-    if data[3] != 0x06 or data[4] != 0x02:
-        return None
-    mfr = data[5]
-    family = data[6] | (data[7] << 7)
-    model = data[8] | (data[9] << 7)
-    version = ''.join(chr(b) for b in data[10:14] if 0x20 <= b <= 0x7E)
-    return mfr, family, model, version
-
-
-def flash_firmware(fsbin_path, device_id=None):
-    """Flash FS.bin to a Zoom MultiStomp pedal in update mode."""
-
-    if not os.path.exists(fsbin_path):
-        print(f"Error: {fsbin_path} not found")
-        sys.exit(1)
-
-    with open(fsbin_path, 'rb') as f:
-        firmware = f.read()
-
-    # Verify it looks like a valid FS.bin
-    if len(firmware) < 0xA000:
-        print(f"Error: file too small ({len(firmware)} bytes)")
-        sys.exit(1)
-    if firmware[0:6] != b'\x55\xAA\x00\x01\x04\x00':
-        print("Warning: file doesn't start with FS.bin magic bytes (55 AA 00 01 04 00)")
-        resp = input("Continue anyway? [y/N] ")
-        if resp.lower() != 'y':
-            sys.exit(1)
-
-    flash_addr = FLASH_MAP['FS.bin']['address']
-    erase_size = FLASH_MAP['FS.bin']['erase_size']
-
-    print(f"Firmware: {fsbin_path}")
-    print(f"Size: {len(firmware)} bytes ({len(firmware)//1024} KB)")
-    print(f"Flash address: 0x{flash_addr:06X}")
-    print(f"Erase size: 0x{erase_size:06X} ({erase_size//1024} KB)")
-    print()
-
-    midi = CoreMIDI()
-    dest_ep, src_ep = midi.find_zoom()
-
-    if not dest_ep or not src_ep:
-        print("Error: Zoom MS Series MIDI device not found!")
-        print("Make sure the pedal is connected in update mode")
-        print("(hold both arrow buttons while plugging USB)")
-        sys.exit(1)
-
-    print("Found ZOOM MS Series")
-    midi.connect_source(src_ep)
-    time.sleep(0.1)
-
-    # Step 1: Identity Request
-    print("Sending Identity Request...")
-    midi.clear_received()
-    midi.send_sysex_async(dest_ep, identity_request())
-    reply = midi.receive(timeout=3.0)
-
-    if reply is None:
-        print("Error: No reply from device")
-        sys.exit(1)
-
-    ident = parse_identity(reply)
-    if ident is None:
-        print(f"Error: Invalid identity reply: {reply.hex(' ')}")
-        sys.exit(1)
-
-    mfr, family, model, version = ident
-    if mfr != ZOOM_MANUFACTURER_ID:
-        print(f"Error: Not a Zoom device (manufacturer 0x{mfr:02X})")
-        sys.exit(1)
-
-    dev_id = family  # Zoom puts device ID in family field
-    device_names = {
-        MS70CDR_DEVICE_ID: "MS-70CDR",
-        MS50G_DEVICE_ID: "MS-50G",
-        MS60B_DEVICE_ID: "MS-60B",
-    }
-    dev_name = device_names.get(dev_id, f"Unknown (0x{dev_id:02X})")
-    print(f"Device: {dev_name} (ID: 0x{dev_id:02X}), firmware: {version}")
-
-    if device_id and dev_id != device_id:
-        print(f"Error: Expected device 0x{device_id:02X}, got 0x{dev_id:02X}")
-        sys.exit(1)
-
-    # Step 2: Send "Can Update" / enter update mode
-    print("\nSending update request...")
-    midi.clear_received()
-    can_update_msg = make_sysex(dev_id, 0x60)
-    midi.send_sysex_async(dest_ep, can_update_msg)
-    reply = midi.receive(timeout=3.0)
-    if reply:
-        print(f"  Reply: {reply.hex(' ')}")
-
-    # Step 3: Flash Erase
-    print(f"\nErasing flash at 0x{flash_addr:06X}, size 0x{erase_size:06X}...")
-    erase_msg = make_sysex(dev_id, 0x71,
-                           encode_address(flash_addr),
-                           encode_size(erase_size))
-    midi.clear_received()
-    midi.send_sysex_async(dest_ep, erase_msg)
-    # Erase takes time — wait for ACK
-    reply = midi.receive(timeout=30.0)
-    if reply:
-        print(f"  Erase reply: {reply.hex(' ')}")
+def load_images(args):
+    images = []
+    if args.full:
+        for name in FULL_ORDER:
+            path = os.path.join(args.full, name)
+            if name == 'FS.bin' and args.fs:
+                path = args.fs
+            images.append((name, path))
     else:
-        print("  Warning: No erase reply (continuing...)")
+        images.append(('FS.bin', args.fs))
 
-    # Step 4: Flash Write in chunks
-    print(f"\nWriting {len(firmware)} bytes...")
-    chunk_size = 256  # bytes per SysEx write
-    total_chunks = (len(firmware) + chunk_size - 1) // chunk_size
-
-    for i in range(total_chunks):
-        offset = i * chunk_size
-        chunk = firmware[offset:offset + chunk_size]
-        addr = flash_addr + offset
-
-        encoded_data = encode_7bit(chunk)
-        write_msg = make_sysex(dev_id, 0x72,
-                               encode_address(addr),
-                               encode_size(len(chunk)),
-                               encoded_data)
-
-        midi.send_sysex_async(dest_ep, write_msg)
-
-        # Wait for ACK between chunks
-        reply = midi.receive(timeout=5.0)
-        if reply and len(reply) > 4:
-            # Check for error in reply
-            if reply[4] == 0x00:  # Error response
-                print(f"\n  Error at offset 0x{offset:06X}: {reply.hex(' ')}")
-                sys.exit(1)
-
-        if (i + 1) % 50 == 0 or i == total_chunks - 1:
-            pct = (i + 1) * 100 // total_chunks
-            print(f"  [{pct:3d}%] {offset + len(chunk):>7d}/{len(firmware)} bytes", end='\r')
-
-    print()
-
-    # Step 5: Done Update
-    print("\nSending update complete...")
-    done_msg = make_sysex(dev_id, 0x61)
-    midi.send_sysex_async(dest_ep, done_msg)
-    reply = midi.receive(timeout=5.0)
-    if reply:
-        print(f"  Reply: {reply.hex(' ')}")
-
-    print("\nDone! Power-cycle the pedal to boot with new firmware.")
-    print("If the pedal doesn't boot, re-flash with the original updater app.")
+    loaded = []
+    for name, path in images:
+        data = open(path, 'rb').read()
+        addr, area = LAYOUT[name]
+        if len(data) > area:
+            raise SystemExit(f"{path}: {len(data)} bytes exceeds flash area 0x{area:X}")
+        if name == 'FS.bin' and data[:6] != b'\x55\xAA\x00\x01\x04\x00':
+            raise SystemExit(f"{path}: not an FS.bin image (bad magic)")
+        loaded.append((name, path, addr, area, data))
+    return loaded
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python3 zoom_flash.py <FS.bin>")
-        print()
-        print("Flash a modified FS.bin to a Zoom MultiStomp pedal.")
-        print("The pedal must be in update mode (hold both arrow buttons + USB).")
-        print()
-        print("Supported pedals: MS-50G, MS-60B, MS-70CDR")
-        sys.exit(1)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('fs', nargs='?', help='FS.bin to flash')
+    ap.add_argument('--full', metavar='DIR',
+                    help='flash boot/Preset/FS/Main like the official updater, from DIR '
+                         '(e.g. "...Updater.app/Contents/Resources"); FS.bin overridable by positional arg')
+    ap.add_argument('--port', default='ZOOM MS', help='MIDI port name substring (default: "ZOOM MS")')
+    ap.add_argument('--dry-run', action='store_true', help='build all packets, do not touch the pedal')
+    ap.add_argument('--log', help='write raw SysEx traffic to this file')
+    ap.add_argument('-y', '--yes', action='store_true', help='do not ask for confirmation')
+    args = ap.parse_args()
+    if not args.fs and not args.full:
+        ap.error('give an FS.bin path and/or --full DIR')
 
-    fsbin_path = sys.argv[1]
-    flash_firmware(fsbin_path)
+    images = load_images(args)
+    print("Plan:")
+    print(f"  erase 0x{MARKER_ERASE[0]:06X} +0x{MARKER_ERASE[1]:X}")
+    for name, path, addr, area, data in images:
+        print(f"  erase 0x{addr:06X} +0x{area:X}, write {name} ({len(data)} bytes, "
+              f"{-(-len(data) // CHUNK)} packets) <- {path}")
+
+    if args.dry_run:
+        n = 0
+        for name, path, addr, area, data in images:
+            for off in range(0, len(data), CHUNK):
+                pkt = msg_write(0x61, addr + off, data[off:off + CHUNK])
+                assert all(b < 0x80 for b in pkt)
+                n += 1
+        print(f"Dry run OK: {n} write packets built, all 7-bit clean.")
+        return
+
+    log = open(args.log, 'w') if args.log else None
+    pedal = Pedal(find_port(args.port), log)
+    dev, version = pedal.identify()
+    print(f"\nDevice: {DEVICES.get(dev, f'0x{dev:02X}')} (id 0x{dev:02X}), boot/firmware version {version}")
+    if dev not in DEVICES:
+        raise SystemExit("Unknown device id, aborting.")
+
+    if not args.yes:
+        if input("Flash now? Do NOT unplug during flashing. [y/N] ").strip().lower() != 'y':
+            raise SystemExit("Aborted.")
+
+    t0 = time.time()
+    pedal.command(msg_can_update(dev), 5, 'CanUpdate')
+    print("Update mode accepted.")
+    pedal.erase(*MARKER_ERASE)
+    for name, path, addr, area, data in images:
+        print(f"Erasing {name} area 0x{addr:06X}...")
+        pedal.erase(addr, area)
+        pedal.write(addr, data, name)
+    pedal.command(msg_packet_processed(dev), 30, 'PacketProcessed')
+    print(f"\nDone in {time.time() - t0:.0f}s. Power-cycle the pedal.")
+    if log:
+        log.close()
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except RuntimeError as e:
+        print(f"\nERROR: {e}\nPedal stays in update mode; re-run this script or the official updater.")
+        sys.exit(1)
