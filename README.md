@@ -84,6 +84,8 @@ firmware stay untouched. `--full DIR` reproduces the official updater exactly
 (boot.bin, Preset.bin, FS.bin, Main.bin from an extracted updater's `Resources` folder).
 
 Tested on MS-70CDR (boot 1.10): FS.bin flashed in ~40 s, all 1426 packets acknowledged.
+After reboot the stock MS-70CDR v2.10 main firmware shows the new DRIVE and AMP
+categories with all 29 MS-50G drive/amp effects — no Main.bin change needed.
 If anything fails mid-way the pedal stays in update mode — just re-run the script
 (or the official updater with the stock firmware).
 
