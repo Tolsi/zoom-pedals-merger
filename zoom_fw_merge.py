@@ -160,10 +160,15 @@ class ZoomFirmware:
             current = struct.unpack_from('<H', self.raw, blk_off + 2)[0]
         return chain
 
-    def _reserve_table_block(self):
-        next_entry_end = self.table_entries_end + ENTRY_SIZE
-        if next_entry_end > DATA_OFFSET:
-            needed_blocks = (next_entry_end - DATA_OFFSET + BLOCK_SIZE - 1) // BLOCK_SIZE
+    def reserve_table_blocks(self, extra_entries=0):
+        """Reserve data blocks the file table will need after adding entries.
+
+        Must be called BEFORE injecting patches, with the total number of
+        patches to add, so blocks are protected before any data lands on them.
+        """
+        future_end = self.table_entries_end + max(1, extra_entries) * ENTRY_SIZE
+        if future_end > DATA_OFFSET:
+            needed_blocks = (future_end - DATA_OFFSET + BLOCK_SIZE - 1) // BLOCK_SIZE
             for i in range(needed_blocks):
                 if self.block_owner[i] is None:
                     self.block_owner[i] = '__FILE_TABLE__'
@@ -213,11 +218,6 @@ class ZoomFirmware:
             raise ValueError(f"Need {blocks_needed} blocks, only {len(free)} free")
         if any(p['filename'] == filename for p in self.patches):
             raise ValueError(f"{filename} already exists")
-
-        self._reserve_table_block()
-        free = self.get_free_blocks()
-        if len(free) < blocks_needed:
-            raise ValueError(f"Need {blocks_needed} blocks, only {len(free)} free (after table reservation)")
 
         allocated = free[:blocks_needed]
 
@@ -398,6 +398,8 @@ def cmd_merge(args):
     print(f"Merging {len(to_add)} effects into target...")
     print(f"Before: {len(fw_target.patches)} patches, "
           f"{len(fw_target.get_free_blocks())} free blocks\n")
+
+    fw_target.reserve_table_blocks(len(to_add))
 
     added = 0
     for name in to_add:
