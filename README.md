@@ -155,7 +155,7 @@ else:
 
 #### Step 2: Fix the macOS crash
 
-Compile a small dylib that adds the missing method:
+Compile a small dylib that adds the missing method (source also in [`macos/fix_alert.m`](macos/fix_alert.m)):
 
 ```bash
 cat > /tmp/fix_alert.m << 'EOF'
